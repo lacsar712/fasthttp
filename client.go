@@ -574,6 +574,14 @@ func (c *Client) Do(req *Request, resp *Response) error {
 		return err
 	}
 
+	// Read the request-scoped policy stack at the Client exit too, so a
+	// frame that cannot merge with this host (for example force_dual on a
+	// custom Dial) fails before entering HostClient.Do. HostClient.Do
+	// resolves the frame again and applies it.
+	if _, err = hc.resolveRequestPolicy(req); err != nil {
+		return err
+	}
+
 	atomic.AddInt32(&hc.pendingClientRequests, 1)
 	defer atomic.AddInt32(&hc.pendingClientRequests, -1)
 	return hc.Do(req, resp)
@@ -1654,8 +1662,19 @@ func (c *HostClient) DoRedirects(req *Request, resp *Response, maxRedirectsCount
 // It is recommended obtaining req and resp via AcquireRequest
 // and AcquireResponse in performance-critical code.
 func (c *HostClient) Do(req *Request, resp *Response) error {
+	// Resolve the request-scoped policy stack top against this HostClient
+	// baseline before any connection, dial or timeout decision is made.
+	eff, err := c.resolveRequestPolicy(req)
+	if err != nil {
+		return err
+	}
+	prevEffective := req.policyEffective
+	req.policyEffective = eff
+	defer func() {
+		req.policyEffective = prevEffective
+	}()
+
 	var (
-		err          error
 		retry        bool
 		resetTimeout bool
 	)
@@ -1666,11 +1685,28 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 	attempts := 0
 	hasBodyStream := req.IsBodyStream()
 
+	// Keep the caller-supplied timeout intact across the call and expose to
+	// the internals only the timeout left after deadline_merge resolution.
+	// baseline_only hides the call timeout, so connection waits, dialing and
+	// read/write deadlines see only the HostClient baseline.
+	originalTimeout := req.timeout
+	timeout := originalTimeout
+	if eff != nil && eff.ignoreCallTimeout {
+		// baseline_only: DoTimeout/DoDeadline must not tighten connection,
+		// dial or read/write deadlines for this frame.
+		timeout = 0
+	}
+	if timeout != originalTimeout {
+		req.timeout = 0
+	}
+	defer func() {
+		req.timeout = originalTimeout
+	}()
+
 	// If a request has a timeout we store the timeout
 	// and calculate a deadline so we can keep updating the
 	// timeout on each retry.
 	deadline := time.Time{}
-	timeout := req.timeout
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
@@ -1726,8 +1762,9 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 	}
 	atomic.AddInt32(&c.pendingRequests, -1)
 
-	// Restore the original timeout.
-	req.timeout = timeout
+	// Restore the original timeout. The deferred assignment above covers
+	// early exits as well.
+	req.timeout = originalTimeout
 
 	if err == io.EOF {
 		err = ErrConnectionClosed
@@ -1757,7 +1794,7 @@ func (c *HostClient) do(req *Request, resp *Response) (bool, error) {
 		if err != nil {
 			return retry, err
 		}
-		if err = closeOrDrainResponseBody(resp, responseBodyDrainSize(c.MaxResponseBodySize)); err != nil {
+		if err = closeOrDrainResponseBody(resp, responseBodyDrainSize(c.effectiveBodyCap(req))); err != nil {
 			return true, err
 		}
 		return retry, nil
@@ -1791,9 +1828,12 @@ func (c *HostClient) doNonNilReqResp(req *Request, resp *Response) (bool, error)
 	// Free up resources occupied by response before sending the request,
 	// so the GC may reclaim these resources (e.g. response body).
 
-	// Preserve response options that may have been set explicitly.
+	// Preserve response options that may have been set explicitly. A pushed
+	// stream_prefer frame forces the streaming path for this call without
+	// touching c.StreamResponseBody.
 	customSkipBody := resp.SkipBody
-	customStreamBody := !req.forceResponseBodyBuffering && (resp.StreamBody || c.StreamResponseBody)
+	streamPrefer := req.policyEffective != nil && req.policyEffective.streamPrefer && !req.forceResponseBodyBuffering
+	customStreamBody := !req.forceResponseBodyBuffering && (resp.StreamBody || c.StreamResponseBody || streamPrefer)
 	customNoDefaultContentType := resp.Header.noDefaultContentType
 	resp.Reset()
 	resp.SkipBody = customSkipBody
@@ -1821,6 +1861,16 @@ func (c *HostClient) transport() RoundTripper {
 		return DefaultTransport
 	}
 	return c.Transport
+}
+
+// effectiveBodyCap reports the merged buffered response body cap for an
+// in-flight request: the resolved frame cap when a frame is active, else the
+// HostClient baseline.
+func (c *HostClient) effectiveBodyCap(req *Request) int {
+	if req.policyEffective != nil {
+		return req.policyEffective.bodyCap
+	}
+	return c.MaxResponseBodySize
 }
 
 var (
@@ -1895,6 +1945,15 @@ func (c *HostClient) serveWaiterLocked() bool {
 }
 
 func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
+	return c.acquireConn(reqTimeout, connectionClose, nil)
+}
+
+// acquireConn is AcquireConn with the resolved request-scoped policy frame.
+// A nil eff means pin: every branch below then matches the historical
+// AcquireConn behavior exactly.
+func (c *HostClient) acquireConn(
+	reqTimeout time.Duration, connectionClose bool, eff *resolvedClientPolicy,
+) (cc *clientConn, err error) {
 	createConn := false
 	startCleaner := false
 
@@ -1933,9 +1992,12 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		return cc, nil
 	}
 	if !createConn {
-		if c.MaxConnWaitTimeout <= 0 {
+		// fail_fast: never enter the wait queue.
+		if eff != nil && eff.connWaitFailFast {
 			return nil, ErrNoFreeConns
 		}
+
+		blockUntilFree := eff != nil && eff.connWaitBlock
 
 		//nolint:dupword
 		// reqTimeout    c.MaxConnWaitTimeout   wait duration
@@ -1943,20 +2005,51 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		//  0(not set)            d2            d2
 		//     d1            0(don't wait)      0(don't wait)
 		//  0(not set)            d2            d2
-		timeout := c.MaxConnWaitTimeout
-		timeoutOverridden := false
-		// reqTimeout == 0 means not set
-		if reqTimeout > 0 && reqTimeout < timeout {
+		var (
+			timeout      time.Duration
+			timeoutErr   error
+			timerEnabled bool
+		)
+		switch {
+		case blockUntilFree:
+			// block_until_free ignores MaxConnWaitTimeout: wait for a free
+			// connection, bounded only by the call timeout. With no call
+			// timeout the wait is unbounded.
 			timeout = reqTimeout
-			timeoutOverridden = true
+			timeoutErr = ErrTimeout
+			timerEnabled = reqTimeout > 0
+		default:
+			if c.MaxConnWaitTimeout <= 0 {
+				return nil, ErrNoFreeConns
+			}
+			timeout = c.MaxConnWaitTimeout
+			timeoutErr = ErrNoFreeConns
+			// reqTimeout == 0 means not set
+			if reqTimeout > 0 && reqTimeout < timeout {
+				timeout = reqTimeout
+				timeoutErr = ErrTimeout
+			}
+			timerEnabled = true
 		}
 
 		// wait for a free connection
-		tc := AcquireTimer(timeout)
-		defer ReleaseTimer(tc)
+		var tc *time.Timer
+		var tcCh <-chan time.Time
+		if timerEnabled {
+			tc = AcquireTimer(timeout)
+			defer ReleaseTimer(tc)
+			tcCh = tc.C
+		}
 
 		w := &wantConn{
 			ready: make(chan struct{}, 1),
+		}
+		// A connection dialed for a parked waiter runs on a background
+		// goroutine without the request frame; carry the resolved dial
+		// override on the waiter so the dial IP stack is still honored.
+		if eff != nil && eff.dialOverride {
+			w.hasDialPolicy = true
+			w.dialDualStack = eff.dialDualStack
 		}
 		defer func() {
 			if err != nil {
@@ -1969,11 +2062,8 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		select {
 		case <-w.ready:
 			return w.conn, w.err
-		case <-tc.C:
-			if timeoutOverridden {
-				return nil, ErrTimeout
-			}
-			return nil, ErrNoFreeConns
+		case <-tcCh:
+			return nil, timeoutErr
 		}
 	}
 
@@ -1981,7 +2071,7 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		go c.connsCleaner()
 	}
 
-	conn, err := c.dialHostHard(reqTimeout)
+	conn, err := c.dialHostHard(reqTimeout, eff)
 	if err != nil {
 		c.decConnsCount()
 		return nil, err
@@ -2043,7 +2133,16 @@ func (c *HostClient) queueForIdle(w *wantConn, connectionClose bool) {
 }
 
 func (c *HostClient) dialConnFor(w *wantConn) {
-	conn, err := c.dialHostHard(0)
+	var eff *resolvedClientPolicy
+	if w.hasDialPolicy {
+		// Background dial on behalf of a parked request: honor only the
+		// dial IP stack override; there is no call timeout to cap with.
+		eff = &resolvedClientPolicy{
+			dialOverride:  true,
+			dialDualStack: w.dialDualStack,
+		}
+	}
+	conn, err := c.dialHostHard(0, eff)
 	if err != nil {
 		w.tryDeliver(nil, err)
 		c.decConnsCount()
@@ -2138,13 +2237,6 @@ func (c *HostClient) CloseConn(cc *clientConn) {
 }
 
 func (c *HostClient) decConnsCount() {
-	if c.MaxConnWaitTimeout <= 0 {
-		c.connsLock.Lock()
-		c.connsCount--
-		c.connsLock.Unlock()
-		return
-	}
-
 	c.connsLock.Lock()
 	defer c.connsLock.Unlock()
 	if c.connsCount > c.maxConnsLocked() {
@@ -2153,6 +2245,10 @@ func (c *HostClient) decConnsCount() {
 		c.connsCount--
 		return
 	}
+	// Under pin with MaxConnWaitTimeout <= 0 no caller ever parks, so the
+	// queue is empty and this behaves as a plain decrement. A
+	// block_until_free frame parks independently of MaxConnWaitTimeout, and
+	// its waiter must receive the freed slot by dialing a replacement.
 	if !c.serveWaiterLocked() {
 		c.connsCount--
 	}
@@ -2206,33 +2302,33 @@ func (c *HostClient) releaseConn(cc *clientConn) {
 	cc.lastUseTime = time.Now()
 	startCleaner := false
 	c.connsLock.Lock()
-	if c.MaxConnWaitTimeout <= 0 {
-		c.conns = append(c.conns, cc)
-	} else {
-		// try to deliver an idle connection to a *wantConn
-		delivered := false
-		if q := c.connsWait; q != nil {
-			for q.len() > 0 {
-				w := q.popFront()
-				if w.waiting() {
-					delivered = w.tryDeliver(cc, nil)
-					// This is the last resort to hand over conCount sema.
-					// We must ensure that there are no valid waiters in connsWait
-					// when we exit this loop.
-					//
-					// We did not apply the same looping pattern in the decConnsCount
-					// method because it needs to create a new time-spent connection,
-					// and the decConnsCount call chain will inevitably reach this point.
-					// When MaxConnWaitTimeout>0.
-					if delivered {
-						break
-					}
+	// Try to deliver the idle connection to a parked *wantConn first. With
+	// pin and MaxConnWaitTimeout <= 0 the queue is always empty (pin callers
+	// fail fast instead of parking), so this is equivalent to just pooling
+	// the connection. block_until_free frames park regardless of
+	// MaxConnWaitTimeout and must be handed the released connection.
+	delivered := false
+	if q := c.connsWait; q != nil {
+		for q.len() > 0 {
+			w := q.popFront()
+			if w.waiting() {
+				delivered = w.tryDeliver(cc, nil)
+				// This is the last resort to hand over conCount sema.
+				// We must ensure that there are no valid waiters in connsWait
+				// when we exit this loop.
+				//
+				// We did not apply the same looping pattern in the decConnsCount
+				// method because it needs to create a new time-spent connection,
+				// and the decConnsCount call chain will inevitably reach this point.
+				// When MaxConnWaitTimeout>0.
+				if delivered {
+					break
 				}
 			}
 		}
-		if !delivered {
-			c.conns = append(c.conns, cc)
-		}
+	}
+	if !delivered {
+		c.conns = append(c.conns, cc)
 	}
 	// A connection may be pooled while the conns cleaner is not running, for
 	// example a replacement dialed for a waiter that timed out and cancelled.
@@ -2348,7 +2444,9 @@ func (c *HostClient) nextAddr() string {
 	return addr
 }
 
-func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err error) {
+func (c *HostClient) dialHostHard(
+	dialTimeout time.Duration, eff *resolvedClientPolicy,
+) (conn net.Conn, err error) {
 	// use dialTimeout to control the timeout of each dial. It does not work if dialTimeout is 0 or if
 	// c.DialTimeout has not been set and c.Dial has been set.
 	// attempt to dial all the available hosts before giving up.
@@ -2366,7 +2464,27 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 	if timeout <= 0 {
 		timeout = DefaultDialTimeout
 	}
+	// call_caps_baseline: the call timeout caps the whole dial loop, so a
+	// larger baseline cannot let dialing outlive the call deadline.
+	if eff != nil && eff.callCapsBaseline && dialTimeout > 0 && dialTimeout < timeout {
+		timeout = dialTimeout
+	}
 	deadline := time.Now().Add(timeout)
+
+	dualStack := c.DialDualStack
+	if eff != nil && eff.dialOverride {
+		dualStack = eff.dialDualStack
+	}
+
+	// call_caps_baseline: the TLS handshake deadline is the baseline write
+	// deadline capped by the call timeout, including covering a baseline
+	// that leaves the handshake unbounded (writeTimeout == 0).
+	writeTimeout := c.WriteTimeout
+	if eff != nil && eff.callCapsBaseline && dialTimeout > 0 &&
+		(writeTimeout <= 0 || dialTimeout < writeTimeout) {
+		writeTimeout = dialTimeout
+	}
+
 	for n > 0 {
 		addr := c.nextAddr()
 		var tlsConfig *tls.Config
@@ -2377,7 +2495,7 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 				continue
 			}
 		}
-		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS, tlsConfig, dialTimeout, c.WriteTimeout)
+		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, dualStack, c.IsTLS, tlsConfig, dialTimeout, writeTimeout)
 		if err == nil {
 			return conn, nil
 		}
@@ -2527,6 +2645,11 @@ type wantConn struct {
 	ready chan struct{}
 	conn  *clientConn
 	mu    sync.Mutex // protects conn, err, close(ready)
+
+	// Per-request dial policy carried into the background dialConnFor
+	// goroutine, which has no access to the request frame itself.
+	hasDialPolicy bool
+	dialDualStack bool
 }
 
 // waiting reports whether w is still waiting for an answer (connection or error).
@@ -2834,6 +2957,14 @@ type pipelineWork struct {
 	t        *time.Timer
 	done     chan struct{}
 	reqCopy  Request
+
+	// timerArmed reports whether t holds the current call timeout. Pooled
+	// works may carry a stopped/stale timer, so waiters select on t.C only
+	// when this is true.
+	timerArmed bool
+	// capConnDeadline makes the worker cap this request's read/write
+	// deadlines by the absolute call deadline (call_caps_baseline).
+	capConnDeadline bool
 }
 
 // DoTimeout performs the given request and waits for response during
@@ -2879,10 +3010,16 @@ func (c *PipelineClient) DoTimeout(req *Request, resp *Response, timeout time.Du
 // to preserve caller buffer ownership across timeouts, so enabling
 // KeepBodyBuffer is not necessarily faster for this method.
 func (c *PipelineClient) DoDeadline(req *Request, resp *Response, deadline time.Time) error {
-	return c.getConnClient().DoDeadline(req, resp, deadline)
+	eff, err := c.resolveRequestPolicy(req, time.Until(deadline))
+	if err != nil {
+		return err
+	}
+	return c.getConnClient().DoDeadline(req, resp, deadline, eff)
 }
 
-func (c *pipelineConnClient) DoDeadline(req *Request, resp *Response, deadline time.Time) error {
+func (c *pipelineConnClient) DoDeadline(
+	req *Request, resp *Response, deadline time.Time, eff *resolvedPipelinePolicy,
+) error {
 	timeout := time.Until(deadline)
 	if timeout <= 0 {
 		return ErrTimeout
@@ -2909,7 +3046,17 @@ func (c *pipelineConnClient) DoDeadline(req *Request, resp *Response, deadline t
 		}
 	}
 
-	w := c.acquirePipelineWork(timeout)
+	// deadline_merge decides which timeout actually arms the work:
+	// baseline_only leaves it unarmed, so only the worker baseline
+	// ReadTimeout/WriteTimeout bound the call.
+	callTimeout := timeout
+	capConnDeadline := false
+	if eff != nil {
+		callTimeout = eff.callTimeout
+		capConnDeadline = eff.capConnDeadline
+	}
+	w := c.acquirePipelineWork(callTimeout)
+	w.capConnDeadline = capConnDeadline
 	w.respCopy.Header.disableNormalizing = c.DisableHeaderNamesNormalizing
 	streamBody := resp != nil && resp.StreamBody
 	w.respCopy.StreamBody = streamBody
@@ -2933,24 +3080,97 @@ func (c *pipelineConnClient) DoDeadline(req *Request, resp *Response, deadline t
 		swapRequestBody(req, &w.reqCopy)
 	}
 
-	// Put the request to outgoing queue
+	// Put the request to outgoing queue, honoring conn_wait.
+	if err := c.enqueuePipelineWork(chs, w, eff); err != nil {
+		return err
+	}
+
+	return c.awaitPipelineWork(w, resp, streamBody)
+}
+
+// enqueuePipelineWork admits w to the pending-request channel following the
+// resolved conn_wait mode:
+//   - pin keeps the historical behavior (a deadline call waits up to its
+//     timer, a plain Do substitutes the oldest work),
+//   - fail_fast returns ErrNoFreeConns without queueing or substituting,
+//   - block_until_free waits for a slot (bounded by the call timer) and
+//     never substitutes another request.
+func (c *pipelineConnClient) enqueuePipelineWork(
+	chs *pipelineConnChannels, w *pipelineWork, eff *resolvedPipelinePolicy,
+) error {
+	// Fast path: len(c.ch) < cap(c.ch)
 	select {
 	case chs.chW <- w:
-		// Fast path: len(c.ch) < cap(c.ch)
+		return nil
 	default:
-		// Slow path
+	}
+
+	failFast := eff != nil && eff.connWaitFailFast
+	block := eff != nil && eff.connWaitBlock
+
+	if failFast {
+		select {
+		case chs.chW <- w:
+			return nil
+		default:
+			c.releasePipelineWork(w)
+			return ErrNoFreeConns
+		}
+	}
+
+	if block || !w.timerArmed {
+		// block_until_free, or a plain Do without an armed timer: block on a
+		// slot when blocking is allowed. Pin plain Do substitutes the oldest
+		// work instead, handled below.
+		if block && w.timerArmed {
+			select {
+			case chs.chW <- w:
+				return nil
+			case <-w.t.C:
+				c.releasePipelineWork(w)
+				return ErrTimeout
+			}
+		}
+		if block {
+			// Unbounded block until a slot frees.
+			chs.chW <- w
+			return nil
+		}
+	}
+
+	if w.timerArmed {
+		// Pin deadline call: wait up to the call timer, no substitution.
 		select {
 		case chs.chW <- w:
 		case <-w.t.C:
 			c.releasePipelineWork(w)
 			return ErrTimeout
 		}
+		return nil
 	}
 
-	// Wait for the response
-	var err error
+	// Pin plain Do: try substituting the oldest w with the current one.
 	select {
-	case <-w.done:
+	case wOld := <-chs.chW:
+		wOld.err = ErrPipelineOverflow
+		wOld.done <- struct{}{}
+	default:
+	}
+	select {
+	case chs.chW <- w:
+	default:
+		c.releasePipelineWork(w)
+		return ErrPipelineOverflow
+	}
+	return nil
+}
+
+// awaitPipelineWork waits for the pipelined response, selecting on the call
+// timer only when the frame armed one.
+func (c *pipelineConnClient) awaitPipelineWork(
+	w *pipelineWork, resp *Response, streamBody bool,
+) error {
+	finish := func() error {
 		if resp != nil {
 			if resp.KeepBodyBuffer && resp.body != nil {
 				w.respCopy.copyToSkipBody(resp)
@@ -2964,13 +3184,22 @@ func (c *pipelineConnClient) DoDeadline(req *Request, resp *Response, deadline t
 			}
 			resp.StreamBody = streamBody
 		}
-		err = w.err
+		err := w.err
 		c.releasePipelineWork(w)
-	case <-w.t.C:
-		err = ErrTimeout
+		return err
 	}
 
-	return err
+	if !w.timerArmed {
+		<-w.done
+		return finish()
+	}
+
+	select {
+	case <-w.done:
+		return finish()
+	case <-w.t.C:
+		return ErrTimeout
+	}
 }
 
 func (c *pipelineConnClient) acquirePipelineWork(timeout time.Duration) (w *pipelineWork) {
@@ -2984,6 +3213,7 @@ func (c *pipelineConnClient) acquirePipelineWork(timeout time.Duration) (w *pipe
 	}
 	w.reqCopy.KeepBodyBuffer = false
 	w.respCopy.KeepBodyBuffer = false
+	w.capConnDeadline = false
 	if timeout > 0 {
 		if w.t == nil {
 			w.t = time.NewTimer(timeout)
@@ -2991,8 +3221,13 @@ func (c *pipelineConnClient) acquirePipelineWork(timeout time.Duration) (w *pipe
 			w.t.Reset(timeout)
 		}
 		w.deadline = time.Now().Add(timeout)
+		w.timerArmed = true
 	} else {
+		if w.t != nil {
+			w.t.Stop()
+		}
 		w.deadline = zeroTime
+		w.timerArmed = false
 	}
 	return w
 }
@@ -3008,6 +3243,8 @@ func (c *pipelineConnClient) releasePipelineWork(w *pipelineWork) {
 	w.req = nil
 	w.resp = nil
 	w.err = nil
+	w.timerArmed = false
+	w.capConnDeadline = false
 	c.workPool.Put(w)
 }
 
@@ -3023,10 +3260,18 @@ func (c *pipelineConnClient) releasePipelineWork(w *pipelineWork) {
 // It is recommended obtaining req and resp via AcquireRequest
 // and AcquireResponse in performance-critical code.
 func (c *PipelineClient) Do(req *Request, resp *Response) error {
-	return c.getConnClient().Do(req, resp)
+	// A plain Do carries no call timeout. conn_wait and deadline_merge
+	// frames still apply from here.
+	eff, err := c.resolveRequestPolicy(req, 0)
+	if err != nil {
+		return err
+	}
+	return c.getConnClient().Do(req, resp, eff)
 }
 
-func (c *pipelineConnClient) Do(req *Request, resp *Response) error {
+func (c *pipelineConnClient) Do(
+	req *Request, resp *Response, eff *resolvedPipelinePolicy,
+) error {
 	if err := c.ensureTLSConfig(); err != nil {
 		return err
 	}
@@ -3049,7 +3294,12 @@ func (c *pipelineConnClient) Do(req *Request, resp *Response) error {
 		}
 	}
 
+	// A plain Do never arms a caller timer; call_caps_baseline still flows
+	// to the worker in case a deadline-bearing frame reached here.
 	w := c.acquirePipelineWork(0)
+	if eff != nil {
+		w.capConnDeadline = eff.capConnDeadline
+	}
 	w.req = req
 	if resp != nil {
 		resp.Header.disableNormalizing = c.DisableHeaderNamesNormalizing
@@ -3058,23 +3308,9 @@ func (c *pipelineConnClient) Do(req *Request, resp *Response) error {
 		w.resp = &w.respCopy
 	}
 
-	// Put the request to outgoing queue
-	select {
-	case chs.chW <- w:
-	default:
-		// Try substituting the oldest w with the current one.
-		select {
-		case wOld := <-chs.chW:
-			wOld.err = ErrPipelineOverflow
-			wOld.done <- struct{}{}
-		default:
-		}
-		select {
-		case chs.chW <- w:
-		default:
-			c.releasePipelineWork(w)
-			return ErrPipelineOverflow
-		}
+	// Put the request to outgoing queue, honoring conn_wait.
+	if err := c.enqueuePipelineWork(chs, w, eff); err != nil {
+		return err
 	}
 
 	// Wait for the response
@@ -3361,11 +3597,20 @@ func (c *pipelineConnClient) writer(conn net.Conn, stopCh <-chan struct{}, chs *
 
 		w.resp.ParseNetConn(conn)
 
+		// call_caps_baseline: the call deadline caps the per-request write
+		// deadline, including when the baseline leaves writes unbounded.
+		writeDeadline := time.Time{}
 		if writeTimeout > 0 {
+			writeDeadline = time.Now().Add(writeTimeout)
+		}
+		if w.capConnDeadline && !w.deadline.IsZero() &&
+			(writeDeadline.IsZero() || w.deadline.Before(writeDeadline)) {
+			writeDeadline = w.deadline
+		}
+		if !writeDeadline.IsZero() {
 			// Set Deadline every time, since golang has fixed the performance issue
 			// See https://github.com/golang/go/issues/15133#issuecomment-271571395 for details
-			currentTime := time.Now()
-			if err = conn.SetWriteDeadline(currentTime.Add(writeTimeout)); err != nil {
+			if err = conn.SetWriteDeadline(writeDeadline); err != nil {
 				w.err = err
 				w.done <- struct{}{}
 				return err
@@ -3443,11 +3688,20 @@ func (c *pipelineConnClient) reader(conn net.Conn, stopCh <-chan struct{}, chs *
 			}
 		}
 
+		// call_caps_baseline: the call deadline caps the per-request read
+		// deadline, including when the baseline leaves reads unbounded.
+		readDeadline := time.Time{}
 		if readTimeout > 0 {
+			readDeadline = time.Now().Add(readTimeout)
+		}
+		if w.capConnDeadline && !w.deadline.IsZero() &&
+			(readDeadline.IsZero() || w.deadline.Before(readDeadline)) {
+			readDeadline = w.deadline
+		}
+		if !readDeadline.IsZero() {
 			// Set Deadline every time, since golang has fixed the performance issue
 			// See https://github.com/golang/go/issues/15133#issuecomment-271571395 for details
-			currentTime := time.Now()
-			if err = conn.SetReadDeadline(currentTime.Add(readTimeout)); err != nil {
+			if err = conn.SetReadDeadline(readDeadline); err != nil {
 				w.err = err
 				w.done <- struct{}{}
 				return err
@@ -3577,12 +3831,14 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	customSkipBody := resp.SkipBody
 	customStreamBody := resp.StreamBody
 
+	eff := req.policyEffective
+
 	var deadline time.Time
 	if req.timeout > 0 {
 		deadline = time.Now().Add(req.timeout)
 	}
 
-	cc, err := hc.AcquireConn(req.timeout, req.ConnectionClose())
+	cc, err := hc.acquireConn(req.timeout, req.ConnectionClose(), eff)
 	if err != nil {
 		return false, err
 	}
@@ -3657,8 +3913,22 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		resp.Header.DisableNormalizing()
 	}
 
+	// Merge the body_materialize frame with the HostClient baseline.
+	maxBodySize := hc.MaxResponseBodySize
+	if eff != nil {
+		maxBodySize = eff.bodyCap
+		// enforce_cap without any positive merged cap must fail explicitly
+		// when the body would otherwise be buffered unboundedly. A skipped or
+		// streamed body is not materialized, so it is left alone.
+		if eff.enforceBodyCap && maxBodySize <= 0 &&
+			!resp.SkipBody && !customStreamBody {
+			hc.CloseConn(cc)
+			return false, ErrClientPolicyBodyLimit
+		}
+	}
+
 	br := hc.AcquireReader(conn)
-	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
+	err = resp.ReadLimitBody(br, maxBodySize)
 	if err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)

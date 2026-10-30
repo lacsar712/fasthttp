@@ -71,6 +71,18 @@ type Request struct {
 	// if <= 0, means not set
 	timeout time.Duration
 
+	// policyTop is the head of the request-scoped client policy stack pushed
+	// via PushClientPolicy/WithClientPolicy. It is per-request state, never a
+	// process-global: concurrent calls on distinct requests carry independent
+	// stacks. Not copied by CopyTo and cleared by Reset.
+	policyTop *clientPolicyFrame
+
+	// policyEffective is the resolved top frame for the current
+	// HostClient/PipelineClient call. It is set on entry, consumed by the
+	// connection, dial and body paths, and cleared again on return. Not
+	// copied by CopyTo.
+	policyEffective *resolvedClientPolicy
+
 	secureErrorLogMessage bool
 
 	// Group bool members in order to reduce Request object size.
@@ -1503,6 +1515,8 @@ func (req *Request) Reset() {
 	req.forceResponseBodyBuffering = false
 	req.UseHostHeader = false
 	req.DisableRedirectPathNormalizing = false
+	// Drop any frame a previous owner of a pooled Request forgot to pop.
+	req.policyTop = nil
 }
 
 func (req *Request) resetSkipHeader() {
